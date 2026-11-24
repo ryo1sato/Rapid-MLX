@@ -4,7 +4,12 @@
 import json
 import uuid
 
-from ..reasoning.inkling_parser import TOOL, InklingBlocks
+from ..reasoning.inkling_parser import (
+    TOOL,
+    InklingBlocks,
+    _aligned_token_prefix,
+    _token_text_matches,
+)
 from .abstract_tool_parser import (
     ExtractedToolCallInformation,
     ToolParser,
@@ -22,7 +27,7 @@ class InklingToolParser(ToolParser):
 
     def reset(self):
         super().reset()
-        self.blocks = InklingBlocks()
+        self.blocks = InklingBlocks(self.model_tokenizer)
         self.payload = None
         self.index = 0
         self.streaming = False
@@ -66,7 +71,8 @@ class InklingToolParser(ToolParser):
                     content.append(self.payload)
                 self.payload = None
 
-        for kind, value in events:
+        for event in events:
+            kind, value = event[:2]
             if kind == "marker":
                 close()
                 if value == TOOL:
@@ -83,6 +89,17 @@ class InklingToolParser(ToolParser):
         parser = type(self)(self.model_tokenizer)
         content, calls = parser._consume(
             parser.blocks.feed(model_output, final=True), final=True
+        )
+        return ExtractedToolCallInformation(bool(calls), calls, content or None)
+
+    def extract_tool_calls_with_tokens(self, model_output, request=None, *, token_ids):
+        if not _token_text_matches(self.model_tokenizer, model_output, token_ids):
+            return self.extract_tool_calls(model_output, request)
+        parser = type(self)(self.model_tokenizer)
+        if not parser.blocks.marker_ids:
+            return self.extract_tool_calls(model_output, request)
+        content, calls = parser._consume(
+            parser.blocks.feed_tokens(token_ids, final=True), final=True
         )
         return ExtractedToolCallInformation(bool(calls), calls, content or None)
 
@@ -120,11 +137,39 @@ class InklingToolParser(ToolParser):
         request=None,
     ):
         self.streaming = True
+        self.blocks.disable_tokens()
         content, _ = self._consume(self.blocks.feed(delta_text))
         return self._wire(content)
 
+    def extract_tool_calls_streaming_with_tokens(
+        self, previous_text, current_text, delta_text, *, request=None, delta_token_ids
+    ):
+        self.streaming = True
+        aligned = _aligned_token_prefix(
+            self.model_tokenizer,
+            delta_text,
+            self.blocks._deferred_token_ids + list(delta_token_ids),
+        )
+        if not self.blocks.marker_ids or self.blocks.token_disabled or aligned is None:
+            self.blocks.disable_tokens()
+            events = self.blocks.feed(delta_text)
+        else:
+            complete_ids, deferred_ids = aligned
+            self.blocks._deferred_token_ids = list(deferred_ids)
+            events = self.blocks.feed_tokens(complete_ids)
+            if events is None:
+                self.blocks.disable_tokens()
+                events = self.blocks.feed(delta_text)
+        content, _ = self._consume(events)
+        return self._wire(content)
+
     def finalize_legacy_raw_stream(self, full_text, request=None):
-        content, _ = self._consume(self.blocks.feed("", final=True), final=True)
+        if self.blocks.token_mode:
+            content, _ = self._consume(self.blocks.feed_tokens([], final=True) or [])
+        else:
+            content = ""
+        tail, _ = self._consume(self.blocks.feed("", final=True), final=True)
+        content += tail
         return self._wire(content)
 
 
